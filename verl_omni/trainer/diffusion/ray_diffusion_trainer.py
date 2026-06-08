@@ -281,13 +281,76 @@ class BaseRayDiffusionTrainer(ABC):
         visual_folder = os.path.join(dump_path, f"{self.global_steps}")
         os.makedirs(visual_folder, exist_ok=True)
 
-        output_paths = []
-        images_pil = outputs.cpu().float().permute(0, 2, 3, 1).numpy()
-        images_pil = (images_pil * 255).round().clip(0, 255).astype("uint8")
-        for i, image in enumerate(images_pil):
-            image_path = os.path.join(visual_folder, f"{i}.jpg")
-            Image.fromarray(image).save(image_path)
-            output_paths.append(image_path)
+        def to_uint8(array: np.ndarray) -> np.ndarray:
+            if array.size and array.min() < -0.05:
+                array = (array + 1.0) / 2.0
+            return (array * 255).round().clip(0, 255).astype("uint8")
+
+        def save_image(image: torch.Tensor, path: str):
+            image_np = image.cpu().float().numpy()
+            if image_np.ndim != 3:
+                raise ValueError(f"Expected image tensor with 3 dims, got shape {tuple(image.shape)}")
+            if image_np.shape[0] in (1, 3):
+                image_np = np.transpose(image_np, (1, 2, 0))
+            elif image_np.shape[-1] not in (1, 3):
+                raise ValueError(f"Cannot infer channel dimension for image shape {tuple(image.shape)}")
+            image_np = to_uint8(image_np)
+            if image_np.shape[-1] == 1:
+                image_np = image_np[..., 0]
+            Image.fromarray(image_np).save(path)
+
+        def save_video(video: torch.Tensor, path: str):
+            import imageio.v3 as iio
+
+            video_np = video.cpu().float().numpy()
+            if video_np.ndim != 4:
+                raise ValueError(f"Expected video tensor with 4 dims, got shape {tuple(video.shape)}")
+            if video_np.shape[0] in (1, 3):
+                # C, T, H, W -> T, H, W, C
+                video_np = np.transpose(video_np, (1, 2, 3, 0))
+            elif video_np.shape[1] in (1, 3):
+                # T, C, H, W -> T, H, W, C
+                video_np = np.transpose(video_np, (0, 2, 3, 1))
+            elif video_np.shape[-1] not in (1, 3):
+                raise ValueError(f"Cannot infer channel dimension for video shape {tuple(video.shape)}")
+            video_np = to_uint8(video_np)
+            if video_np.shape[-1] == 1:
+                video_np = np.repeat(video_np, 3, axis=-1)
+            iio.imwrite(path, video_np, fps=8, codec="libx264")
+
+        def save_visual_outputs(outputs: torch.Tensor):
+            outputs = outputs.detach().cpu().float()
+            if outputs.ndim >= 5 and (
+                outputs.shape[-4] in (1, 3) or outputs.shape[-3] in (1, 3) or outputs.shape[-1] in (1, 3)
+            ):
+                visual_ndim = 4
+                suffix = ".mp4"
+                saver = save_video
+            elif outputs.ndim >= 4 and (outputs.shape[-3] in (1, 3) or outputs.shape[-1] in (1, 3)):
+                visual_ndim = 3
+                suffix = ".jpg"
+                saver = save_image
+            else:
+                raise ValueError(f"Cannot infer visual tensor layout for output shape {tuple(outputs.shape)}")
+
+            leading_shape = tuple(outputs.shape[:-visual_ndim])
+            flat_outputs = outputs.reshape(-1, *outputs.shape[-visual_ndim:])
+            flat_paths = []
+            for flat_idx, visual in enumerate(flat_outputs):
+                if len(leading_shape) <= 1:
+                    stem = str(flat_idx)
+                else:
+                    stem = "_".join(str(idx) for idx in np.unravel_index(flat_idx, leading_shape))
+                visual_path = os.path.join(visual_folder, f"{stem}{suffix}")
+                saver(visual, visual_path)
+                flat_paths.append(visual_path)
+
+            if len(leading_shape) >= 2 and leading_shape[0] == len(inputs):
+                group_size = int(np.prod(leading_shape[1:]))
+                return [flat_paths[i * group_size : (i + 1) * group_size] for i in range(leading_shape[0])]
+            return flat_paths
+
+        output_paths = save_visual_outputs(outputs)
 
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
 
