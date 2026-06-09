@@ -41,7 +41,7 @@ If work is duplicate/trivial busywork, **do not proceed**. Return a short explan
 
 ### Personal fork workflow
 
-- Push development changes frequently to the personal fork `pufanyi/verl-omni`.
+- Push development changes frequently directly to `main` on the personal fork `pufanyi/verl-omni`.
 - Do not open PRs to the upstream/company repository; keep development work private to the personal fork unless explicitly instructed otherwise.
 - Regularly merge or sync from upstream so the personal fork stays current.
 
