@@ -14,6 +14,7 @@
 import argparse
 import logging
 import os
+import socket
 from dataclasses import asdict
 from typing import Any, Optional
 
@@ -24,7 +25,6 @@ import torchvision.transforms as T
 import vllm_omni.entrypoints.cli.serve
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.import_utils import import_external_libs
-from verl.utils.net_utils import get_free_port
 from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.rollout.utils import run_uvicorn
 from verl.workers.rollout.vllm_rollout.utils import (
@@ -48,6 +48,30 @@ from verl_omni.workers.rollout.replica import DiffusionOutput
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
+
+
+def _reserve_diffusion_master_port(address: str, replica_rank: int) -> tuple[int, socket.socket]:
+    """Reserve a per-replica TCP port for vLLM-Omni diffusion worker rendezvous."""
+    base = int(os.getenv("VLLM_OMNI_DIFFUSION_MASTER_PORT_BASE", "35000"))
+    span = int(os.getenv("VLLM_OMNI_DIFFUSION_MASTER_PORT_STRIDE", "100"))
+    if span <= 0:
+        raise ValueError(f"VLLM_OMNI_DIFFUSION_MASTER_PORT_STRIDE must be positive, got {span}.")
+
+    family = socket.AF_INET6 if ":" in address else socket.AF_INET
+    start = base + int(replica_rank) * span
+    for port in range(start, start + span):
+        sock = socket.socket(family=family, type=socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((address, port))
+        except OSError:
+            sock.close()
+            continue
+        return port, sock
+    raise RuntimeError(
+        f"No free vLLM-Omni diffusion worker port in [{start}, {start + span}) "
+        f"for replica_rank={replica_rank}."
+    )
 
 
 class vLLMOmniHttpServer(vLLMHttpServer):
@@ -135,15 +159,21 @@ class vLLMOmniHttpServer(vLLMHttpServer):
             engine_args["enable_dummy_pipeline"] = True
             engine_args["custom_pipeline_args"] = {"pipeline_class": pipeline_path}
 
-        diffusion_master_port, diffusion_master_sock = get_free_port("127.0.0.1", with_alive_sock=True)
-        diffusion_master_sock.close()
+        diffusion_master_port, diffusion_master_sock = _reserve_diffusion_master_port(
+            "127.0.0.1", self.replica_rank
+        )
 
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = str(diffusion_master_port)
-        logger.info("Using MASTER_PORT=%s for vLLM-Omni diffusion workers", os.environ["MASTER_PORT"])
+        logger.info(
+            "Using MASTER_PORT=%s for vLLM-Omni diffusion workers (replica_rank=%s)",
+            os.environ["MASTER_PORT"],
+            self.replica_rank,
+        )
 
         # Apply before AsyncOmni builds OmniDiffusionConfig in this process.
         VLLMOmniHijack.hijack()
+        diffusion_master_sock.close()
         engine_client = AsyncOmni(**engine_args)
         app = build_app(args)
         await omni_init_app_state(engine_client, app.state, args)
